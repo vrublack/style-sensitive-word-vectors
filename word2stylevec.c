@@ -54,6 +54,7 @@ char save_vocab_file[MAX_STRING_FILE], read_vocab_file[MAX_STRING_FILE];
 struct vocab_word *vocab;
 // add: iwindow, fixthr, layer1s_size
 int binary = 1, cbow = 1, debug_mode = 2, iwindow = 5, fixthr = 1, min_count = 5, num_threads = 12, min_reduce = 1;
+int use_near = 1, use_dist = 1;
 int *vocab_hash;
 long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 600, layer1s_size = 300;
 long long train_words = 0, word_count_actual = 0, iter = 10, file_size = 0, classes = 0;
@@ -461,21 +462,29 @@ void *TrainModelThread(void *id) {
         if (last_word == -1) continue;
         /* processing for C^{near} */
         if (abs(sentence_position - context_position) < threshold){
-            for (c = 0; c < layer1_size; c++) neu1[c] += syn0[c + last_word * layer1_size];
-            cw_ds++;
+            if (use_near) {
+                for (c = 0; c < layer1_size; c++) neu1[c] += syn0[c + last_word * layer1_size];
+                cw_ds++;
+            }
         }
         /* processing for C^{dist} */
         else {
-            for (c = 0; c < layer1s_size; c++) neu1s[c] += syn0[c + last_word * layer1_size];
-            cw_s++;
+            if (use_dist) {
+                for (c = 0; c < layer1s_size; c++) neu1s[c] += syn0[c + last_word * layer1_size];
+                cw_s++;
+            }
         }
       }
 
       if (cw_ds || cw_s) {
         /* processing for C^{near} */
-        if (cw_ds) for (c = 0; c < layer1_size; c++) neu1[c] /= cw_ds;
+        if (use_near) {
+            if (cw_ds) for (c = 0; c < layer1_size; c++) neu1[c] /= cw_ds;
+        }
         /* processing for C^{dist} */
-        if (cw_s) for (c = 0; c < layer1s_size; c++) neu1s[c] /= cw_s;
+        if (use_dist) {
+            if (cw_s) for (c = 0; c < layer1s_size; c++) neu1s[c] /= cw_s;
+        }
 
         // HIERARCHICAL SOFTMAX
         // Unimplemented
@@ -495,7 +504,7 @@ void *TrainModelThread(void *id) {
           l2 = target * layer1_size;
 
           /* processing for C^{near} */
-          if (cw_ds){
+          if (use_near && cw_ds){
               f = 0;
               for (c = 0; c < layer1_size; c++) f += neu1[c] * syn1neg[c + l2];
               if (f > MAX_EXP) g = (label - 1);
@@ -508,7 +517,7 @@ void *TrainModelThread(void *id) {
           }
 
           /* processing for C^{dist} */
-          if (cw_s){
+          if (use_dist && cw_s){
               f = 0;
               for (c = 0; c < layer1s_size; c++) f += neu1s[c] * syn1neg[c + l2];
               if (f > MAX_EXP) g = (label - 1);
@@ -529,12 +538,20 @@ void *TrainModelThread(void *id) {
           if (last_word == -1) continue;
           /* processing for C^{near} */
           if (abs(sentence_position - context_position) <= threshold){
-              for (c = 0; c < layer1s_size; c++) syn0[c + last_word * layer1_size] += (neu1e[c] / 2);       // update stylistic dimensions  //consider learning rate and the expectation of the number of updates
-              for (c = layer1s_size; c < layer1_size; c++) syn0[c + last_word * layer1_size] += neu1e[c];   // update syntactic/semantic dimensions
+              if (use_near) {
+                  for (c = 0; c < layer1s_size; c++)
+                      syn0[c + last_word * layer1_size] += (neu1e[c] /
+                                                            2);       // update stylistic dimensions  //consider learning rate and the expectation of the number of updates
+                  for (c = layer1s_size; c < layer1_size; c++)
+                      syn0[c + last_word * layer1_size] += neu1e[c];   // update syntactic/semantic dimensions
+              }
           }
           /* processing for C^{dist} */
           else {
-              for (c = 0; c < layer1s_size; c++) syn0[c + last_word * layer1_size] += (neu1es[c] / 2);    // update stylistic dimensions
+              if (use_dist) {
+                  for (c = 0; c < layer1s_size; c++)
+                      syn0[c + last_word * layer1_size] += (neu1es[c] / 2);    // update stylistic dimensions
+              }
           }
         }
       }
@@ -719,6 +736,8 @@ int main(int argc, char **argv) {
   if ((i = ArgPos((char *)"-size-s", argc, argv)) > 0) layer1s_size = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-iwindow-threshold", argc, argv)) > 0) iwindow = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-fix-threshold", argc, argv)) > 0) fixthr = atoi(argv[i + 1]);
+  if ((i = ArgPos((char *)"-use-near", argc, argv)) > 0) use_near = atoi(argv[i + 1]);
+  if ((i = ArgPos((char *)"-use-dist", argc, argv)) > 0) use_dist = atoi(argv[i + 1]);
   vocab = (struct vocab_word *)calloc(vocab_max_size, sizeof(struct vocab_word));
   vocab_hash = (int *)calloc(vocab_hash_size, sizeof(int));
   expTable = (real *)malloc((EXP_TABLE_SIZE + 1) * sizeof(real));
@@ -727,7 +746,7 @@ int main(int argc, char **argv) {
     expTable[i] = expTable[i] / (expTable[i] + 1);                   // Precompute f(x) = x / (x + 1)
   }
   // output a settings
-  printf("SETTINGS={size:%llu, size-s:%llu, train:%s, save-vocab:%s, read-vocab:%s, debug:%d, binary:%d, cbow:%d, alpha:%f, output:%s, iwindow-threshold:%d, fix-threshold:%d, sample:%f, negative:%d, threads:%d, iter:%llu, min-count:%d, classes:%llu}\n", layer1_size, layer1s_size, train_file, save_vocab_file, read_vocab_file, debug_mode, binary, cbow, alpha, output_file, iwindow, fixthr, sample, negative, num_threads, iter, min_count, classes);
+  printf("SETTINGS={size:%llu, size-s:%llu, train:%s, save-vocab:%s, read-vocab:%s, debug:%d, binary:%d, cbow:%d, alpha:%f, output:%s, iwindow-threshold:%d, fix-threshold:%d, sample:%f, negative:%d, threads:%d, iter:%llu, min-count:%d, classes:%llu, use-near:%d, use-dist:%d}\n", layer1_size, layer1s_size, train_file, save_vocab_file, read_vocab_file, debug_mode, binary, cbow, alpha, output_file, iwindow, fixthr, sample, negative, num_threads, iter, min_count, classes, use_near, use_dist);
   TrainModel();
   return 0;
 }
