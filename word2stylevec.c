@@ -31,6 +31,9 @@
 #include <string.h>
 #include <math.h>
 #include <pthread.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
 
 #define MAX_STRING 100
 #define MAX_STRING_FILE 200     //extend (original: 100)
@@ -38,6 +41,20 @@
 #define MAX_EXP 6
 #define MAX_SENTENCE_LENGTH 1000
 #define MAX_CODE_LENGTH 40
+
+
+void handler(int sig) {
+    void *array[10];
+    size_t size;
+
+    // get void*'s for all entries on the stack
+    size = backtrace(array, 10);
+
+    // print out all the frames to stderr
+    fprintf(stderr, "Error: signal %d:\n", sig);
+    backtrace_symbols_fd(array, size, STDERR_FILENO);
+    exit(1);
+}
 
 const int vocab_hash_size = 30000000;  // Maximum 30 * 0.7 = 21M words in the vocabulary
 
@@ -660,6 +677,8 @@ int ArgPos(char *str, int argc, char **argv) {
 
 /** add arguments and output a settings **/
 int main(int argc, char **argv) {
+  signal(SIGSEGV, handler);
+
   int i;
   if (argc == 1) {
     printf("word2stylevec\n\n");
