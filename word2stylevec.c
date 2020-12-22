@@ -24,13 +24,12 @@
 //
 // Reina Akama @ 2018 
 
-
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <pthread.h>
+#include "pthread_barrier.h"
 #include <execinfo.h>
 #include <signal.h>
 #include <unistd.h>
@@ -71,14 +70,17 @@ char save_vocab_file[MAX_STRING_FILE], read_vocab_file[MAX_STRING_FILE];
 struct vocab_word *vocab;
 // add: iwindow, fixthr, layer1s_size
 int binary = 1, cbow = 1, debug_mode = 2, iwindow = 5, fixthr = 1, min_count = 5, num_threads = 12, min_reduce = 1;
+int* thread_done;
 int use_near = 1, use_dist = 1;
 int *vocab_hash;
 long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 600, layer1s_size = 300;
 long long train_words = 0, word_count_actual = 0, file_size = 0, classes = 0;
 double iter = 10.0;
+double save_every = -1;
 real alpha = 0.025, starting_alpha, sample = 1e-3;
 real *syn0, *syn1, *syn1neg, *expTable;
 clock_t start;
+pthread_barrier_t barrier;
 
 int negative = 5;
 const int table_size = 1e8;
@@ -337,6 +339,70 @@ void SaveVocab() {
   fclose(fo);
 }
 
+void SaveVectors(float iteration) {
+    long a, b, c, d;
+    char output_file_formatted[MAX_STRING_FILE + 20];
+    if (iteration == -1)
+        sprintf(output_file_formatted, "%s_final.bin", output_file);
+    else
+        sprintf(output_file_formatted, "%s_iter_%lld.bin", output_file, (long long) (iteration * 10000));
+    FILE *fo = fopen(output_file_formatted, "wb");
+    if (classes == 0) {
+        // Save the word vectors
+        fprintf(fo, "%lld %lld\n", vocab_size, layer1_size);
+        for (a = 0; a < vocab_size; a++) {
+            fprintf(fo, "%s ", vocab[a].word);
+            if (binary) for (b = 0; b < layer1_size; b++) fwrite(&syn0[a * layer1_size + b], sizeof(real), 1, fo);
+            else for (b = 0; b < layer1_size; b++) fprintf(fo, "%lf ", syn0[a * layer1_size + b]);
+            fprintf(fo, "\n");
+        }
+    } else {
+        // Run K-means on the word vectors
+        int clcn = classes, iter = 10, closeid;
+        int *centcn = (int *)malloc(classes * sizeof(int));
+        int *cl = (int *)calloc(vocab_size, sizeof(int));
+        real closev, x;
+        real *cent = (real *)calloc(classes * layer1_size, sizeof(real));
+        for (a = 0; a < vocab_size; a++) cl[a] = a % clcn;
+        for (a = 0; a < iter; a++) {
+            for (b = 0; b < clcn * layer1_size; b++) cent[b] = 0;
+            for (b = 0; b < clcn; b++) centcn[b] = 1;
+            for (c = 0; c < vocab_size; c++) {
+                for (d = 0; d < layer1_size; d++) cent[layer1_size * cl[c] + d] += syn0[c * layer1_size + d];
+                centcn[cl[c]]++;
+            }
+            for (b = 0; b < clcn; b++) {
+                closev = 0;
+                for (c = 0; c < layer1_size; c++) {
+                    cent[layer1_size * b + c] /= centcn[b];
+                    closev += cent[layer1_size * b + c] * cent[layer1_size * b + c];
+                }
+                closev = sqrt(closev);
+                for (c = 0; c < layer1_size; c++) cent[layer1_size * b + c] /= closev;
+            }
+            for (c = 0; c < vocab_size; c++) {
+                closev = -10;
+                closeid = 0;
+                for (d = 0; d < clcn; d++) {
+                    x = 0;
+                    for (b = 0; b < layer1_size; b++) x += cent[layer1_size * d + b] * syn0[c * layer1_size + b];
+                    if (x > closev) {
+                        closev = x;
+                        closeid = d;
+                    }
+                }
+                cl[c] = closeid;
+            }
+        }
+        // Save the K-means classes
+        for (a = 0; a < vocab_size; a++) fprintf(fo, "%s %d\n", vocab[a].word, cl[a]);
+        free(centcn);
+        free(cent);
+        free(cl);
+    }
+    fclose(fo);
+}
+
 void ReadVocab() {
   long long a, i = 0;
   char c;
@@ -396,6 +462,7 @@ void *TrainModelThread(void *id) {
   long long word_count = 0, last_word_count = 0, sen[MAX_SENTENCE_LENGTH + 1];
   long long l2, c, target, label;
   double local_iter = iter;
+  double iter_progress, last_iter_progress = 0;
   unsigned long long next_random = (long long)id;
   real loss_iter = 0, loss_iter_s = 0;
   int loss_cnt = 0, loss_cnt_s = 0;
@@ -409,6 +476,24 @@ void *TrainModelThread(void *id) {
   fseek(fi, file_size / (long long)num_threads * (long long)id, SEEK_SET);
 
   while (1) {
+    if (thread_done[(long long)id]) {
+        // have to stick around, otherwise the other barrier can't resume for other threads that are still working
+        pthread_barrier_wait(&barrier);
+
+        int all_done = 1;
+        for (int t_i = 0; t_i < num_threads; t_i++)
+            if (!thread_done[t_i]) {
+                all_done = 0;
+                break;
+            }
+
+        if (all_done)
+            break;
+
+        usleep(1000);
+        continue;
+    }
+
     if (word_count - last_word_count > 10000) {
       word_count_actual += word_count - last_word_count;
       last_word_count = word_count;
@@ -443,12 +528,29 @@ void *TrainModelThread(void *id) {
     }
 
     // partial iteration?
-    if (word_count / (double) train_words * num_threads > local_iter) break;
+    iter_progress = word_count / (double) train_words * num_threads;
+    if (iter_progress > local_iter) {
+        thread_done[(long long)id] = 1;
+        continue;
+    }
+
+    if (save_every != -1 && (int) (iter_progress / save_every) > (int) (last_iter_progress / save_every)) {
+        pthread_barrier_wait(&barrier);
+        if ((long long)id == 0)
+            SaveVectors(iter - local_iter + iter_progress);
+        pthread_barrier_wait(&barrier);
+        last_iter_progress = iter_progress;
+    }
+
     //iteration scheduling
     if (feof(fi) || (word_count > train_words / num_threads)) {
       word_count_actual += word_count - last_word_count;
       local_iter--;
-      if (local_iter == 0) break;
+      last_iter_progress = 0;
+      if (local_iter == 0) {
+          thread_done[(long long)id] = 1;
+          continue;
+      }
       word_count = 0;
       last_word_count = 0;
       sentence_length = 0;
@@ -598,7 +700,6 @@ void *TrainModelThread(void *id) {
 
 void TrainModel() {
   long a, b, c, d;
-  FILE *fo;
   pthread_t *pt = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
   printf("Starting training using file %s\n", train_file);
   starting_alpha = alpha;
@@ -608,64 +709,13 @@ void TrainModel() {
   InitNet();
   if (negative > 0) InitUnigramTable();
   start = clock();
+  thread_done = calloc(num_threads, sizeof(int));
+  pthread_barrier_init (&barrier, NULL, num_threads);
   for (a = 0; a < num_threads; a++) pthread_create(&pt[a], NULL, TrainModelThread, (void *)a);
   for (a = 0; a < num_threads; a++) pthread_join(pt[a], NULL);
   printf("\n");
-  fo = fopen(output_file, "wb");
-  if (classes == 0) {
-    // Save the word vectors
-    fprintf(fo, "%lld %lld\n", vocab_size, layer1_size);
-    for (a = 0; a < vocab_size; a++) {
-      fprintf(fo, "%s ", vocab[a].word);
-      if (binary) for (b = 0; b < layer1_size; b++) fwrite(&syn0[a * layer1_size + b], sizeof(real), 1, fo);
-      else for (b = 0; b < layer1_size; b++) fprintf(fo, "%lf ", syn0[a * layer1_size + b]);
-      fprintf(fo, "\n");
-    }
-  } else {
-    // Run K-means on the word vectors
-    int clcn = classes, iter = 10, closeid;
-    int *centcn = (int *)malloc(classes * sizeof(int));
-    int *cl = (int *)calloc(vocab_size, sizeof(int));
-    real closev, x;
-    real *cent = (real *)calloc(classes * layer1_size, sizeof(real));
-    for (a = 0; a < vocab_size; a++) cl[a] = a % clcn;
-    for (a = 0; a < iter; a++) {
-      for (b = 0; b < clcn * layer1_size; b++) cent[b] = 0;
-      for (b = 0; b < clcn; b++) centcn[b] = 1;
-      for (c = 0; c < vocab_size; c++) {
-        for (d = 0; d < layer1_size; d++) cent[layer1_size * cl[c] + d] += syn0[c * layer1_size + d];
-        centcn[cl[c]]++;
-      }
-      for (b = 0; b < clcn; b++) {
-        closev = 0;
-        for (c = 0; c < layer1_size; c++) {
-          cent[layer1_size * b + c] /= centcn[b];
-          closev += cent[layer1_size * b + c] * cent[layer1_size * b + c];
-        }
-        closev = sqrt(closev);
-        for (c = 0; c < layer1_size; c++) cent[layer1_size * b + c] /= closev;
-      }
-      for (c = 0; c < vocab_size; c++) {
-        closev = -10;
-        closeid = 0;
-        for (d = 0; d < clcn; d++) {
-          x = 0;
-          for (b = 0; b < layer1_size; b++) x += cent[layer1_size * d + b] * syn0[c * layer1_size + b];
-          if (x > closev) {
-            closev = x;
-            closeid = d;
-          }
-        }
-        cl[c] = closeid;
-      }
-    }
-    // Save the K-means classes
-    for (a = 0; a < vocab_size; a++) fprintf(fo, "%s %d\n", vocab[a].word, cl[a]);
-    free(centcn);
-    free(cent);
-    free(cl);
-  }
-  fclose(fo);
+  SaveVectors(-1);
+  free(thread_done);
 }
 
 int ArgPos(char *str, int argc, char **argv) {
@@ -723,6 +773,8 @@ int main(int argc, char **argv) {
     printf("\t\tThe vocabulary will be read from <file>, not constructed from the training data\n");
     printf("\t-cbow <int>\n");
     printf("\t\tUse the continuous bag of words model; default is 1 (use 0 for skip-gram model)\n");
+    printf("\t-save-every <float>\n");
+    printf("\t\tSave vectors every fraction of an iteration\n");
     /* our additional arguments; The default is the value used in our paper. */
     printf("\t-size-s <int>\n");
     printf("\t\tSet size of style vectors; default is 300\n");
@@ -762,6 +814,7 @@ int main(int argc, char **argv) {
   if ((i = ArgPos((char *)"-fix-threshold", argc, argv)) > 0) fixthr = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-use-near", argc, argv)) > 0) use_near = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-use-dist", argc, argv)) > 0) use_dist = atoi(argv[i + 1]);
+  if ((i = ArgPos((char *)"-save-every", argc, argv)) > 0) save_every = atof(argv[i + 1]);
   vocab = (struct vocab_word *)calloc(vocab_max_size, sizeof(struct vocab_word));
   vocab_hash = (int *)calloc(vocab_hash_size, sizeof(int));
   expTable = (real *)malloc((EXP_TABLE_SIZE + 1) * sizeof(real));
