@@ -74,7 +74,8 @@ int binary = 1, cbow = 1, debug_mode = 2, iwindow = 5, fixthr = 1, min_count = 5
 int use_near = 1, use_dist = 1;
 int *vocab_hash;
 long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 600, layer1s_size = 300;
-long long train_words = 0, word_count_actual = 0, iter = 10, file_size = 0, classes = 0;
+long long train_words = 0, word_count_actual = 0, file_size = 0, classes = 0;
+double iter = 10.0;
 real alpha = 0.025, starting_alpha, sample = 1e-3;
 real *syn0, *syn1, *syn1neg, *expTable;
 clock_t start;
@@ -393,7 +394,8 @@ void *TrainModelThread(void *id) {
   // add some variables for stylistic learning
   long long d, cw_ds, cw_s, word, last_word, sentence_length = 0, sentence_position = 0, context_position = 0, threshold;
   long long word_count = 0, last_word_count = 0, sen[MAX_SENTENCE_LENGTH + 1];
-  long long l2, c, target, label, local_iter = iter;
+  long long l2, c, target, label;
+  double local_iter = iter;
   unsigned long long next_random = (long long)id;
   real loss_iter = 0, loss_iter_s = 0;
   int loss_cnt = 0, loss_cnt_s = 0;
@@ -439,6 +441,9 @@ void *TrainModelThread(void *id) {
       }
       sentence_position = 0;
     }
+
+    // partial iteration?
+    if (word_count / (double) train_words * num_threads > local_iter) break;
     //iteration scheduling
     if (feof(fi) || (word_count > train_words / num_threads)) {
       word_count_actual += word_count - last_word_count;
@@ -748,7 +753,7 @@ int main(int argc, char **argv) {
   // if ((i = ArgPos((char *)"-hs", argc, argv)) > 0) hs = atoi(argv[i + 1]);   // Unimplemented Hierarchical Softmax
   if ((i = ArgPos((char *)"-negative", argc, argv)) > 0) negative = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-threads", argc, argv)) > 0) num_threads = atoi(argv[i + 1]);
-  if ((i = ArgPos((char *)"-iter", argc, argv)) > 0) iter = atoi(argv[i + 1]);
+  if ((i = ArgPos((char *)"-iter", argc, argv)) > 0) iter = atof(argv[i + 1]);
   if ((i = ArgPos((char *)"-min-count", argc, argv)) > 0) min_count = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-classes", argc, argv)) > 0) classes = atoi(argv[i + 1]);
   // our additional arguments
@@ -765,7 +770,7 @@ int main(int argc, char **argv) {
     expTable[i] = expTable[i] / (expTable[i] + 1);                   // Precompute f(x) = x / (x + 1)
   }
   // output a settings
-  printf("SETTINGS={size:%llu, size-s:%llu, train:%s, save-vocab:%s, read-vocab:%s, debug:%d, binary:%d, cbow:%d, alpha:%f, output:%s, iwindow-threshold:%d, fix-threshold:%d, sample:%f, negative:%d, threads:%d, iter:%llu, min-count:%d, classes:%llu, use-near:%d, use-dist:%d}\n", layer1_size, layer1s_size, train_file, save_vocab_file, read_vocab_file, debug_mode, binary, cbow, alpha, output_file, iwindow, fixthr, sample, negative, num_threads, iter, min_count, classes, use_near, use_dist);
+  printf("SETTINGS={size:%llu, size-s:%llu, train:%s, save-vocab:%s, read-vocab:%s, debug:%d, binary:%d, cbow:%d, alpha:%f, output:%s, iwindow-threshold:%d, fix-threshold:%d, sample:%f, negative:%d, threads:%d, iter:%f, min-count:%d, classes:%llu, use-near:%d, use-dist:%d}\n", layer1_size, layer1s_size, train_file, save_vocab_file, read_vocab_file, debug_mode, binary, cbow, alpha, output_file, iwindow, fixthr, sample, negative, num_threads, iter, min_count, classes, use_near, use_dist);
   TrainModel();
   return 0;
 }
